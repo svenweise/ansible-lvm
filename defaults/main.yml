@@ -1,0 +1,40 @@
+# vim:ff=unix ts=2 sw=2 ai expandtab
+---
+# If set to false, or all the partitioningwork is already done (eg. run this role twice in a row),
+# don't forget to fill addet_partitions manually so we have partitions we can add to the VG.
+partitioning: true
+
+# If cryptdisk is set to true don't forget to set cryptdisk_pw to your passphrase.
+cryptdisk: false
+#cryptdisk_pw:
+
+# If addisk is true we resize the LVM-Group with the disks/partitions we have at addet_partitions: []
+addisk: true
+# If resizelvm is true we resize the LVM-Volumes
+resizelvm: true
+
+# Remove unwanted mounts and LVM-Volumes
+#remove_mounts: []
+
+# Diskalignment
+disk_align_offset: "2048s"
+
+# Default FileSystem
+fs: ext4
+
+# Default LVM-VolumeGroup
+lvm_group: vg01
+
+# LVM Mounts
+#lv_mounts:
+#  - {vg: '', mount: '', size: '', opts: ''}
+
+# Swapsize
+#swapsize: '8192m' 
+
+# Needet so these variables/lists aren't "undefined" and provoke the "undefined error" when they are filled
+# DO NOT FILL THEM! unless you know what you are doing. ;-)
+# eg. fill addet_partitions if you are running with "partitioning: false"
+addet_disks: []
+addet_partitions: []
+addet_crypted_partitions: []

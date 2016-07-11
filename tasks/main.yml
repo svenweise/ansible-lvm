@@ -1,0 +1,204 @@
+# vim:ff=unix ts=2 sw=2 ai expandtab
+---
+- name: Make sure LVM is installed
+  package: name=lvm2 state=present
+
+- block:
+  - name: Get SCSI-Hosts
+    shell: ls -1 /sys/class/scsi_host
+    register: shell_scsi
+    changed_when: False
+
+  - name: Rescan SCSI-Bus
+    shell: "echo '- - -' > /sys/class/scsi_host/{{ item }}/scan"
+    with_items: "{{ shell_scsi.stdout.split('\n') }}"
+
+  - name: Gather Hardwareinfo
+    setup: gather_subset=hardware
+
+  - name: Search for all (disk) devices without a partition
+    set_fact: addet_disks="{{ addet_disks }} + [ '/dev/{{ item.key }}' ]"
+    with_dict: "{{ ansible_devices }}"
+    when: not item.value.partitions and item.key != "sr0" and item.key !="fd0"
+
+  - name: Take all found new (disk) devices and make a partition
+    command: parted -s "{{ item }}" mklabel gpt mkpart primary "{{ disk_align_offset }}" 100%
+    with_items: "{{ addet_disks | unique }}"
+
+  - name: Generate list of new partitions
+    set_fact: addet_partitions="{{ addet_partitions }} + [ '{{ item }}1' ]"
+    with_items: "{{ addet_disks | unique }}"
+
+  when: partitioning == true
+  # If set to false, or all the partitioningwork is already done (eg. run this role twice in a row),
+  # don't forget to fill addet_partitions manually so we have partitions we can add to the VG.
+
+
+- block:
+  - name: Make sure cryptsetup is installed
+    package: name=cryptsetup,haveged state=present
+
+  - name: Shred Disks
+    command: "shred -v --iterations=1 {{ item }}"
+    with_items: "{{ addet_partitions | unique }}"
+
+  - name: Encrypt partition
+    shell: "echo '{{ cryptdisk_pw }}' | cryptsetup --verbose --use-urandom -h sha512 luksFormat {{ item }}"
+    with_items: "{{ addet_partitions | unique }}"
+
+  - name: Open encrypted partition
+    shell: "echo '{{ cryptdisk_pw }}'  | cryptsetup luksOpen {{ item }} {{ item | basename }}_crypt"
+    with_items: "{{ addet_partitions | unique }}"
+
+  - name: Generate list of new encrypted partitions
+    set_fact: addet_crypted_partitions="{{ addet_crypted_partitions }} + [ '/dev/mapper/{{ item | basename }}_crypt' ]"
+    with_items: "{{ addet_partitions | unique }}"
+
+  - name: Replace addet_partitions fact
+    set_fact: addet_partitions={{ addet_crypted_partitions | unique }}
+
+  when: cryptdisk == true
+
+
+- block:
+  - name: Generate list of VolumeGroups
+    shell:  "vgs --noheadings -o name | sed 's/^[ \t]*//' | sed 's/[ \t]*$//'"
+    register: vgs_list_existing
+
+  - name: Generate list of devices from VolumeGroups
+    shell: "pvs --noheadings -o name --select 'vg_name={{ item }}' | sed 's/^[ \t]*//' | sed 's/[ \t]*$//'"
+    with_items: "{{ vgs_list_existing.stdout_lines }}"
+    register: pvs_dev_list_existing
+
+  - name: Genaerate list of all (old and new) devices for existing VolumeGroup
+    set_fact: lvg_dev_list={{ item.stdout_lines | union(addet_partitions) }}
+    when: item.item  == lvgrp | default(lvm_group)
+    with_items: "{{ pvs_dev_list_existing.results }}"
+
+  - name: Generate list of devices for nonexisting VolumeGroups
+    set_fact: lvg_dev_list={{ addet_partitions }}
+    when: not lvg_dev_list
+
+  - name: Add disks/partitions to VolumeGroup
+    lvg: vg={{ lvgrp | default(lvm_group) }} pvs="{{ lvg_dev_list | join(',') }}"
+
+  when: addisk == true
+
+
+- block:
+  - name: Umount unwanted mountpoints from fstab
+    mount: name={{ item[1].mount }} src={{ item[1].device }} fstype={{ item[1].fstype }} state=unmounted
+    when: item[0] == item[1].mount
+    with_nested:
+      - "{{ remove_mounts }}"
+      - "{{ ansible_mounts }}"
+
+  - name: Remove unwanted mountpoints from fstab
+    mount: name={{ item[1].mount }} src={{ item[1].device }} fstype={{ item[1].fstype }} state=absent
+    when: item[0] == item[1].mount
+    with_nested:
+      - "{{ remove_mounts }}"
+      - "{{ ansible_mounts }}"
+
+  - name: Generate list of unwanted LogicalVolumes
+    shell: "lvs --noheadings -o name,vg_name --select 'lv_path={{ item[1].device }} || lv_dm_path={{ item[1].device }}' | awk '{print $1, $2}'"
+    register: unwanted_lv
+    when: item[0] == item[1].mount
+    with_nested:
+      - "{{ remove_mounts }}"
+      - "{{ ansible_mounts }}"
+
+  - name: Remove unwanted LogicalVolumes
+    lvol: vg={{ item.stdout.split(' ')[1] }} lv={{ item.stdout.split(' ')[0] }} state=absent force=yes
+    when: item.stdout is defined
+    with_items: "{{ unwanted_lv.results }}"
+
+  when: remove_mounts is defined
+
+
+- block:
+  - name: Create/Resize LVM-LV
+    lvol: lv={{ item.mount | basename }} vg={{ item.vg | default(lvm_group) }} size={{ item.size }} opts="--addtag={{ item.mount | basename }}"
+    register: lvolres
+    with_items: "{{ lv_mounts }}"
+
+  - name: Genaerate list of LVs
+    shell: "lvs --noheadings -o name,lv_dm_path --select 'Name != swap && LV_Tags != swap' | awk '{print $1, $2}'"
+    register: lvs_list
+
+  - name: Create Filesystems of LVM-LV
+    filesystem: dev={{ item[1].split(' ')[1] }} fstype={{ item[0].fs | default(fs) }}
+    when: item[0].mount | basename == item[1].split(' ')[0]
+    with_nested:
+      - "{{ lv_mounts }}"
+      - "{{ lvs_list.stdout_lines }}"
+    ignore_errors: yes
+
+  #- name: Resize (mounted) Filesystems
+  #  filesystem: dev={{ item[1].device }} fstype={{ fs }} resizefs=yes
+  #  when: lvolres.changed and item[0].mount is defined item[0].mount == item[1].mount
+  #  with_nested:
+  #    - "{{ lv_mounts }}"
+  #    - "{{ ansible_mounts }}"
+
+  - name: FSTab entry
+    mount: name={{ item[0].mount }} src={{ item[1].split(' ')[1] }} fstype={{ item[0].fs | default(fs) }} opts={{ item[0].opts | default('defaults') }} state=present
+    when: item[0].mount | basename == item[1].split(' ')[0]
+    with_nested:
+      - "{{ lv_mounts }}"
+      - "{{ lvs_list.stdout_lines }}"
+
+  - name: Mount
+    mount: name={{ item[0].mount }} src={{ item[1].split(' ')[1] }} fstype={{ item[0].fs | default(fs) }} opts={{ item[0].opts | default('defaults') }} state=mounted
+    when: item[0].mount | basename == item[1].split(' ')[0]
+    with_nested:
+      - "{{ lv_mounts }}"
+      - "{{ lvs_list.stdout_lines }}"
+
+  - name: Retry resize Filesystems of LVM-LV
+    filesystem: dev={{ item[1].split(' ')[1] }} fstype={{ item[0].fs | default(fs) }} resizefs=yes
+    when: item[0].mount | basename == item[1].split(' ')[0]
+    with_nested:
+      - "{{ lv_mounts }}"
+      - "{{ lvs_list.stdout_lines }}"
+
+  when: lv_mounts is defined
+
+
+- block:
+  - name: Get swap-lv-name at LVM
+    shell: lvs -o LV_Name --noheadings --select 'name=swap || tags=swap' | sed 's/^[ \t]*//' | sed 's/[ \t]*$//'
+    register: swap_lv_name
+
+  - name: Get swap-lv-dm-device at LVM
+    shell: lvs -o LV_DM_Path --noheadings --select 'name=swap || tags=swap' | sed 's/^[ \t]*//' | sed 's/[ \t]*$//'
+    register: swap_lv_dev
+    when: swap_lv_name.stdout
+
+  - name: Get swap-lv-volumegroup at LVM
+    shell: lvs -o VG_Name --noheadings --select 'name=swap || tags=swap' | sed 's/^[ \t]*//' | sed 's/[ \t]*$//'
+    register: swap_lv_vg
+    when: swap_lv_name.stdout
+
+  - name: Resize swap LV
+    lvol: vg={{ swap_lv_vg.stdout }} lv={{ swap_lv_name.stdout }} size={{ swapsize }} force=yes
+    register: swap
+
+  - name: Resize swap
+    command: "{{ item }}"
+    with_items:
+      - sync
+      - echo 3 > /proc/sys/vm/drop_caches
+      - swapoff -a
+      - mkswap {{ swap_lv_dev.stdout | quote }}
+      - swapon -ae
+    when: swap.changed
+
+  when: swapsize is defined
+
+
+#- block:
+#  - name: COMPLIANCE: FSTab entry for /data
+#    mount: name={{ item.mount }} src={{ item.device }} fstype={{ item.fstype }} opts="defaults,acl,nodev,nosuid,noexec" state=mounted
+#    when: item.mount == "/data" and (item.fstype == ext3 or item.fstype == ext4 or item.fstype == xfs )
+#    with_items: "{{ ansible_mounts }}"
